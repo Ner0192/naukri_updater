@@ -178,6 +178,23 @@ def saveDebugScreenshot(driver, name="debug"):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def waitForPageLoad(driver, timeout=30):
+    """
+    Block until document.readyState is 'complete' AND the page has stopped
+    making layout shifts (JS frameworks finish hydrating after readyState).
+    This replaces bare time.sleep() after driver.get() calls.
+    """
+    try:
+        WebDriverWait(driver, timeout).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+        logger.info("Page readyState = complete.")
+    except Exception:
+        logger.warning("waitForPageLoad timed out — continuing anyway.")
+    # Small fixed buffer for React/Vue hydration after readyState fires
+    time.sleep(2)
+
+
 def tearDown(driver):
     """Gracefully close and quit the driver"""
     try:
@@ -221,8 +238,10 @@ def LoadNaukri(headless):
         sys.exit(1)
 
     logger.info("Google Chrome Driver Launched!")
+    driver.set_page_load_timeout(60)  # don't hang forever on slow loads
     driver.implicitly_wait(5)
     driver.get(NaukriURL)
+    waitForPageLoad(driver)  # wait for JS to finish rendering
     return driver
 
 
@@ -286,9 +305,14 @@ def naukriLogin(headless=False):
 
     try:
         driver = LoadNaukri(headless)
-        time.sleep(2)
 
-        if WaitTillElementPresent(driver, login_layer_id, "ID", 10):
+        # Wait for the navbar to finish rendering out of skeleton state
+        # before attempting any interaction with login elements
+        logger.info("Waiting for nav to render...")
+        WaitTillElementPresent(driver, login_layer_id, "ID", 20)
+        time.sleep(1)
+
+        if is_element_present(driver, By.ID, login_layer_id):
             GetElement(driver, login_layer_id, "ID").click()
             time.sleep(1)
 
@@ -349,8 +373,8 @@ def UpdateProfileSummary(driver):
     try:
         logger.info("Navigating to Profile...")
         driver.get("https://www.naukri.com/mnjuser/profile")
-        WaitTillElementPresent(driver, "//body", locator="XPATH", timeout=20)
-        time.sleep(5)
+        waitForPageLoad(driver)  # replaces bare time.sleep(5)
+        time.sleep(3)  # extra buffer for profile-specific JS
 
         logger.info(f"Profile URL   : {driver.current_url}")
         logger.info(f"Profile title : {driver.title}")
