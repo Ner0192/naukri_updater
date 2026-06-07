@@ -1,17 +1,15 @@
 name: Naukri Profile Auto-Updater
 
 on:
-  workflow_dispatch: # Allows you to trigger the script manually from the Actions tab
+  workflow_dispatch:
   schedule:
-    # Runs automatically every day at 02:00 AM UTC (07:30 AM IST). 
-    - cron: '0 2 * * *'
+    - cron: "0 2 * * *"
 
 jobs:
   update-profile:
     runs-on: ubuntu-latest
-    
-    # This tells GitHub to pull secrets specifically from the 'prod' environment
-    environment: prod 
+
+    environment: prod
 
     steps:
       - name: Checkout Repository
@@ -20,7 +18,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.10"
 
       - name: Install Dependencies
         run: |
@@ -32,3 +30,12 @@ jobs:
           NAUKRI_EMAIL: ${{ secrets.NAUKRI_EMAIL }}
           NAUKRI_PASSWORD: ${{ secrets.NAUKRI_PASSWORD }}
         run: python naukri_updater.py
+
+      - name: Upload debug screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: "*.png"
+          if-no-files-found: ignore
+          retention-days: 7

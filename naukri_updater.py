@@ -32,14 +32,13 @@ NaukriURL = "https://www.naukri.com/"
 class ColoredFormatter(logging.Formatter):
     """Custom Formatter to colorize specific parts of the log."""
 
-    grey = "\x1b[90m"  # Light grey for timestamp
-    cyan = "\x1b[36m"  # Cyan for INFO
-    yellow = "\x1b[33m"  # Yellow for WARNING
-    red = "\x1b[31m"  # Red for ERROR
-    reset = "\x1b[0m"  # Reset to terminal default (usually white)
+    grey = "\x1b[90m"
+    cyan = "\x1b[36m"
+    yellow = "\x1b[33m"
+    red = "\x1b[31m"
+    reset = "\x1b[0m"
 
     def format(self, record):
-        # Determine the color for the log level
         if record.levelno == logging.INFO:
             level_color = self.cyan
         elif record.levelno == logging.WARNING:
@@ -49,9 +48,7 @@ class ColoredFormatter(logging.Formatter):
         else:
             level_color = self.reset
 
-        # Build the format string: Grey Time - Colored Level - White Message
         log_fmt = f"{self.grey}%(asctime)s{self.reset} - {level_color}%(levelname)s{self.reset} - %(message)s"
-
         formatter = logging.Formatter(log_fmt)
         return formatter.format(record)
 
@@ -73,7 +70,6 @@ if FILELOGS:
     )
     logger.addHandler(file_handler)
 
-# Environment variables for WebDriverManager logs
 os.environ["WDM_LOCAL"] = "1"
 os.environ["WDM_LOG_LEVEL"] = "0"
 # ==========================================
@@ -165,6 +161,23 @@ def ci(xpath_part: str) -> str:
     return f"translate({xpath_part},'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')"
 
 
+# ── NEW: screenshot helper ────────────────────────────────────────────────────
+def saveDebugScreenshot(driver, name="debug"):
+    """Save a timestamped screenshot for headless debugging.
+    Screenshots are uploaded as GitHub Actions artifacts so you can inspect
+    exactly what the browser was seeing at each stage.
+    """
+    try:
+        filename = f"{name}_{int(time.time())}.png"
+        driver.save_screenshot(filename)
+        logger.info(f"Screenshot saved → {filename}")
+    except Exception as e:
+        logger.warning(f"Could not save screenshot: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 def tearDown(driver):
     """Gracefully close and quit the driver"""
     try:
@@ -188,7 +201,8 @@ def LoadNaukri(headless):
     options.add_argument("--disable-popups")
     options.add_argument("--disable-gpu")
     options.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     )
 
     if headless:
@@ -210,6 +224,50 @@ def LoadNaukri(headless):
     driver.implicitly_wait(5)
     driver.get(NaukriURL)
     return driver
+
+
+# ── NEW: login verification ───────────────────────────────────────────────────
+def verifyLogin(driver):
+    """
+    Confirm the login actually succeeded by checking the post-login URL and DOM.
+    Previously the script set status=True after clicking Login without verifying
+    the result — this catches failed logins (wrong password, CAPTCHA, etc.).
+    Returns True if authenticated, False otherwise.
+    """
+    time.sleep(4)
+    current_url = driver.current_url.lower()
+    logger.info(f"Post-login URL   : {driver.current_url}")
+    logger.info(f"Post-login title : {driver.title}")
+
+    # Still on login / signup page → login failed
+    if "login" in current_url or "signup" in current_url:
+        logger.error("Login FAILED — browser is still on the login/signup page.")
+        saveDebugScreenshot(driver, "login_failed")
+        return False
+
+    # Authenticated nav elements confirm success
+    auth_xpaths = [
+        "//*[contains(@class,'nI-gNb-drawer')]",
+        "//*[contains(@class,'view-profile')]",
+        "//a[contains(@href,'mnjuser/profile')]",
+    ]
+    for xpath in auth_xpaths:
+        if is_element_present(driver, By.XPATH, xpath):
+            logger.info("Login verified via authenticated nav element.")
+            return True
+
+    # Optimistic fallback — URL changed away from login, looks like dashboard
+    if "naukri.com" in current_url:
+        logger.warning("Login status uncertain — proceeding optimistically.")
+        saveDebugScreenshot(driver, "login_uncertain")
+        return True
+
+    logger.error("Login verification failed.")
+    saveDebugScreenshot(driver, "login_unverified")
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def naukriLogin(headless=False):
@@ -253,7 +311,11 @@ def naukriLogin(headless=False):
             time.sleep(1)
 
             loginButton.click()
-            time.sleep(5)
+
+            # ── CHANGED: actually verify login succeeded ──────────────────────
+            if not verifyLogin(driver):
+                return (False, driver)
+            # ─────────────────────────────────────────────────────────────────
 
             # Check for Chatbot and skip
             if is_element_present(driver, By.XPATH, chatbot_cross):
@@ -261,13 +323,14 @@ def naukriLogin(headless=False):
                     GetElement(driver, chatbot_cross, "XPATH").click()
                     logger.info("Chatbot closed.")
                     time.sleep(1)
-                except:
+                except Exception:
                     pass
 
             status = True
             logger.info("Naukri Login Sequence Executed.")
         else:
             logger.error("Could not find login elements.")
+            saveDebugScreenshot(driver, "login_elements_not_found")
 
     except Exception as e:
         catch(e)
@@ -276,106 +339,141 @@ def naukriLogin(headless=False):
 
 
 def UpdateProfileSummary(driver):
-    """Navigates to Profile and appends/removes a dot at the end of the summary."""
+    """
+    Navigates to the Profile page and toggles a trailing dot in the Profile Summary.
+
+    Uses multiple fallback XPath selectors at every step so it keeps working even
+    when Naukri ships frontend changes (the original `lazyProfileSummary` ID is
+    gone in newer builds).
+    """
     try:
         logger.info("Navigating to Profile...")
         driver.get("https://www.naukri.com/mnjuser/profile")
-
         WaitTillElementPresent(driver, "//body", locator="XPATH", timeout=20)
-        time.sleep(3)
+        time.sleep(5)
 
-        # 1. The lazy-load container is in the DOM immediately, but its content
-        #    only renders once scrolled into view. Find it by ID first.
-        lazy_id = "lazyProfileSummary"
-        if not WaitTillElementPresent(driver, lazy_id, "ID", 15):
-            logger.error("lazyProfileSummary container not found on page.")
-            return
+        logger.info(f"Profile URL   : {driver.current_url}")
+        logger.info(f"Profile title : {driver.title}")
+        saveDebugScreenshot(driver, "01_profile_loaded")
 
-        # 2. Scroll the container into view to trigger lazy loading.
-        logger.info("Scrolling to Profile Summary section to trigger lazy load...")
-        lazy_el = GetElement(driver, lazy_id, "ID")
-        if lazy_el:
-            driver.execute_script(
-                "arguments[0].scrollIntoView({block: 'center'});", lazy_el
-            )
-            time.sleep(2)  # wait for the lazy-load JS to render the content
+        # ── Incremental full-page scroll to trigger every lazy-loaded section ─
+        logger.info("Scrolling page to trigger lazy loading...")
+        total_height = driver.execute_script("return document.body.scrollHeight")
+        for pos in range(0, total_height + 600, 350):
+            driver.execute_script(f"window.scrollTo(0, {pos});")
+            time.sleep(0.25)
+        time.sleep(2)
+        driver.execute_script("window.scrollTo(0, 0);")
+        time.sleep(1)
+        saveDebugScreenshot(driver, "02_after_scroll")
 
-        # 3. Now wait for the widgetTitle span to appear inside that section.
-        #    Anchoring to the section ID avoids false matches in the sidebar/other cards.
-        summary_xpath = (
-            "//div[@id='lazyProfileSummary']" "//span[contains(@class, 'widgetTitle')]"
-        )
-
-        if not WaitTillElementPresent(driver, summary_xpath, "XPATH", 15):
-            logger.error("Profile Summary widgetTitle not found after scrolling.")
-            return
-
-        logger.info("Profile Summary section found.")
-        summary_header = GetElement(driver, summary_xpath, locator="XPATH")
-        if summary_header:
-            driver.execute_script(
-                "arguments[0].scrollIntoView({block: 'center'});", summary_header
-            )
-            time.sleep(1)
-
-        # 4. Edit button is a following-sibling of the widgetTitle span.
-        #    Still anchored to the section ID to be unambiguous.
-        edit_locator = (
+        # ── Find Profile Summary edit button (multiple fallbacks) ─────────────
+        # Ordered from most-specific to most-general.
+        edit_xpaths = [
+            # Original selector (Naukri pre-2025 layout)
             "//div[@id='lazyProfileSummary']"
-            "//span[contains(@class, 'widgetTitle')]"
-            "/following-sibling::span[contains(@class, 'edit')]"
-        )
+            "//span[contains(@class,'widgetTitle')]"
+            "/following-sibling::span[contains(@class,'edit')]",
+            # If section container ID changed but still contains 'Summary'
+            "//*[contains(@id,'Summary') or contains(@id,'summary')]"
+            "//span[contains(@class,'edit')]",
+            # Anchor on visible heading text — most resilient to DOM restructuring
+            "//*[contains(text(),'Profile Summary')]"
+            "/following-sibling::*[contains(@class,'edit')]",
+            "//*[contains(text(),'Profile Summary')]" "/..//*[contains(@class,'edit')]",
+            # Broader fallback: any edit span inside a summary-ish container
+            "//span[contains(@class,'edit') and "
+            "ancestor::*[contains(@class,'summary') or contains(@id,'summary')]]",
+        ]
 
-        if not WaitTillElementPresent(driver, edit_locator, "XPATH", 10):
-            logger.error("Edit button for Profile Summary not found.")
+        edit_btn = None
+        for xpath in edit_xpaths:
+            if is_element_present(driver, By.XPATH, xpath):
+                edit_btn = GetElement(driver, xpath, locator="XPATH")
+                if edit_btn:
+                    logger.info(f"Edit button found → {xpath}")
+                    break
+
+        if not edit_btn:
+            logger.error("Profile Summary edit button not found with any selector.")
+            saveDebugScreenshot(driver, "03_edit_not_found")
+            # Dump a page-source snippet so you can spot the new element names
+            src = driver.page_source
+            logger.info(f"Page source snippet (5 000 chars):\n{src[:5000]}")
             return
 
-        edit_btn = GetElement(driver, edit_locator, locator="XPATH")
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center'});", edit_btn
+        )
+        time.sleep(0.5)
         driver.execute_script("arguments[0].click();", edit_btn)
         time.sleep(2)
 
-        # 5. Modify the text inside the drawer textarea.
-        text_area = GetElement(driver, "profileSummaryTxt", locator="ID")
-        if text_area:
-            current_text = text_area.get_attribute("value")
+        # ── Find the textarea (multiple fallbacks) ────────────────────────────
+        textarea_specs = [
+            ("ID", "profileSummaryTxt"),
+            ("XPATH", "//textarea[contains(@id,'profileSummary')]"),
+            ("XPATH", "//textarea[contains(@id,'Summary')]"),
+            ("XPATH", "//textarea[contains(@name,'summary')]"),
+            (
+                "XPATH",
+                "//form[contains(@name,'profileSummary') or contains(@name,'Summary')]//textarea",
+            ),
+        ]
+        text_area = None
+        for lt, loc in textarea_specs:
+            text_area = GetElement(driver, loc, locator=lt)
+            if text_area:
+                logger.info(f"Textarea found → {lt}: {loc}")
+                break
 
-            if current_text and current_text.endswith("."):
-                new_text = current_text[:-1]
-            else:
-                new_text = (current_text or "") + "."
-
-            text_area.send_keys(Keys.CONTROL + "a")
-            time.sleep(0.5)
-            text_area.send_keys(Keys.DELETE)
-            time.sleep(0.5)
-            text_area.send_keys(new_text)
-            time.sleep(1)
-
-            # 6. Save
-            save_btn_xpath = (
-                "//form[@name='profileSummaryForm']"
-                "//button[@type='submit' and text()='Save']"
-            )
-            save_btn = GetElement(driver, save_btn_xpath, locator="XPATH")
-            if save_btn:
-                driver.execute_script("arguments[0].click();", save_btn)
-                logger.info(
-                    f"Profile updated successfully. New length: {len(new_text)}"
-                )
-                time.sleep(3)
-            else:
-                logger.error("Save button not found.")
-        else:
+        if not text_area:
             logger.error("Profile Summary textarea not found.")
+            saveDebugScreenshot(driver, "04_textarea_not_found")
+            return
+
+        current_text = text_area.get_attribute("value") or ""
+        logger.info(f"Current summary length: {len(current_text)}")
+
+        new_text = (
+            current_text[:-1] if current_text.endswith(".") else current_text + "."
+        )
+
+        text_area.send_keys(Keys.CONTROL + "a")
+        time.sleep(0.5)
+        text_area.send_keys(Keys.DELETE)
+        time.sleep(0.5)
+        text_area.send_keys(new_text)
+        time.sleep(1)
+
+        # ── Save button (multiple fallbacks) ──────────────────────────────────
+        save_xpaths = [
+            "//form[@name='profileSummaryForm']//button[@type='submit' and text()='Save']",
+            "//button[@type='submit' and contains(text(),'Save')]",
+            "//button[text()='Save']",
+        ]
+        save_btn = None
+        for xpath in save_xpaths:
+            save_btn = GetElement(driver, xpath, locator="XPATH")
+            if save_btn:
+                break
+
+        if save_btn:
+            driver.execute_script("arguments[0].click();", save_btn)
+            logger.info(f"Profile updated ✓  New length: {len(new_text)}")
+            time.sleep(3)
+        else:
+            logger.error("Save button not found.")
+            saveDebugScreenshot(driver, "05_save_not_found")
 
     except Exception as e:
         catch(e)
+        saveDebugScreenshot(driver, "99_exception")
 
 
 def Logout(driver):
     """Logout from Naukri session using specific Drawer & Logout link XPaths"""
     try:
-        # -------- Drawer Menu XPaths --------
         drawer_xpaths = [
             f"//div[contains({ci('@class')}, 'nI-gNb-drawer')]",
             f"//*[contains({ci('@class')}, 'drawer__icon')]",
@@ -400,7 +498,6 @@ def Logout(driver):
         if not drawer_opened:
             logger.warning("Could not open profile drawer menu.")
 
-        # -------- Logout XPaths --------
         logout_xpaths = [
             f"//a[contains({ci('@href')}, 'logout')]",
             f"//a[.//i[contains({ci('@class')}, 'ni-gnb-icn-logout')]]",
