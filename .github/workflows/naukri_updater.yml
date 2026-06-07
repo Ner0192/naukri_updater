@@ -8,7 +8,7 @@ on:
 jobs:
   update-profile:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 10
     environment: prod
 
     steps:
@@ -26,13 +26,14 @@ jobs:
           pip install selenium webdriver-manager
 
       - name: Run Naukri Updater Script
+        timeout-minutes: 8
         env:
           NAUKRI_EMAIL: ${{ secrets.NAUKRI_EMAIL }}
           NAUKRI_PASSWORD: ${{ secrets.NAUKRI_PASSWORD }}
         run: python naukri_updater.py
 
       - name: Upload debug screenshots
-        if: always()
+        if: always() # run even if the script crashed
         uses: actions/upload-artifact@v4
         with:
           name: debug-screenshots
