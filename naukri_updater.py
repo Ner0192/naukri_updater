@@ -19,6 +19,7 @@ FILELOGS = False
 
 USERNAME = os.environ.get("NAUKRI_EMAIL")
 PASSWORD = os.environ.get("NAUKRI_PASSWORD")
+SAVE_SCREENSHOTS = os.environ.get("SAVE_SCREENSHOTS", "true").lower() == "true"
 
 NaukriURL = "https://www.naukri.com/"
 
@@ -110,7 +111,9 @@ def ci(xpath_part: str) -> str:
 
 
 def saveDebugScreenshot(driver, name="debug"):
-    """Save a timestamped screenshot for headless debugging."""
+    """Save a timestamped screenshot. Controlled by the SAVE_SCREENSHOTS env var."""
+    if not SAVE_SCREENSHOTS:
+        return
     try:
         filename = f"{name}_{int(time.time())}.png"
         driver.save_screenshot(filename)
@@ -229,6 +232,28 @@ def LoadNaukri(headless):
 def verifyLogin(driver):
     """Confirm login actually succeeded by checking URL and authenticated DOM elements."""
     logger.info("Verifying login...")
+
+    # ── Check for error messages shown ON the login form itself ───────────────
+    # These appear immediately (no redirect needed) so check them first.
+    login_error_xpaths = [
+        "//*[contains(text(),'Something went wrong')]",
+        "//*[contains(text(),'Invalid credentials')]",
+        "//*[contains(text(),'incorrect password')]",
+        "//*[contains(text(),'user does not exist')]",
+        "//*[contains(@class,'error') and contains(@class,'login')]",
+    ]
+    time.sleep(1)  # brief pause so the error message can render
+    for xpath in login_error_xpaths:
+        if is_element_present(driver, By.XPATH, xpath):
+            logger.error(
+                "Login FAILED — error message visible on form. "
+                "Check your NAUKRI_PASSWORD secret."
+            )
+            saveDebugScreenshot(driver, "login_form_error")
+            return False
+    # ─────────────────────────────────────────────────────────────────────────
+
+    time.sleep(3)  # wait for post-login redirect to settle
     current_url = driver.current_url.lower()
     logger.info(f"Post-login URL   : {driver.current_url}")
     logger.info(f"Post-login title : {driver.title}")
@@ -319,21 +344,75 @@ def naukriLogin(headless=False):
             saveDebugScreenshot(driver, "02_login_form_not_found")
             return (False, driver)
 
-        # ── Step 3: fill and submit ───────────────────────────────────────────
-        logger.info("Entering credentials...")
-        emailField.clear()
-        for char in USERNAME:
-            emailField.send_keys(char)
-            time.sleep(0.01)
-        time.sleep(0.5)
+        # ── Retry loop: attempt login up to 3 times ───────────────────────────
+        MAX_ATTEMPTS = 3
+        login_error_xpaths = [
+            "//*[contains(text(),'Something went wrong')]",
+            "//*[contains(text(),'Invalid credentials')]",
+            "//*[contains(text(),'incorrect password')]",
+            "//*[contains(text(),'user does not exist')]",
+        ]
 
-        passField.clear()
-        for char in PASSWORD:
-            passField.send_keys(char)
-            time.sleep(0.01)
-        time.sleep(0.5)
+        logged_in = False
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            logger.info(f"Login attempt {attempt}/{MAX_ATTEMPTS}...")
 
-        driver.execute_script("arguments[0].click();", loginButton)
+            # Re-find fields on every attempt (DOM may refresh after a failed try)
+            emailField = waitForElement(
+                driver, "XPATH", username_locator, timeout=10, condition="visible"
+            )
+            passField = waitForElement(
+                driver, "XPATH", password_locator, timeout=10, condition="visible"
+            )
+            loginButton = waitForElement(
+                driver, "XPATH", login_btn_locator, timeout=10, condition="clickable"
+            )
+
+            if not (emailField and passField and loginButton):
+                logger.error(f"Attempt {attempt}: form fields disappeared.")
+                break
+
+            emailField.clear()
+            for char in USERNAME:
+                emailField.send_keys(char)
+                time.sleep(0.01)
+            time.sleep(0.3)
+
+            passField.clear()
+            for char in PASSWORD:
+                passField.send_keys(char)
+                time.sleep(0.01)
+            time.sleep(0.3)
+
+            driver.execute_script("arguments[0].click();", loginButton)
+            time.sleep(2)  # wait for server response / error message to appear
+
+            # Check if an error message appeared on the form
+            error_found = any(
+                is_element_present(driver, By.XPATH, xp) for xp in login_error_xpaths
+            )
+
+            if error_found:
+                saveDebugScreenshot(driver, f"login_attempt_{attempt}_failed")
+                if attempt < MAX_ATTEMPTS:
+                    logger.warning(
+                        f"Attempt {attempt} failed — error on form. "
+                        f"Retrying in 3s..."
+                    )
+                    time.sleep(3)
+                else:
+                    logger.error(
+                        f"All {MAX_ATTEMPTS} login attempts failed. "
+                        "Check your NAUKRI_PASSWORD secret."
+                    )
+            else:
+                logger.info(f"Attempt {attempt}: no error on form — proceeding.")
+                logged_in = True
+                break
+
+        if not logged_in:
+            return (False, driver)
+        # ─────────────────────────────────────────────────────────────────────
 
         if not verifyLogin(driver):
             return (False, driver)
@@ -469,7 +548,39 @@ def UpdateProfileSummary(driver):
         if save_btn:
             driver.execute_script("arguments[0].click();", save_btn)
             logger.info(f"Profile updated ✓  New length: {len(new_text)}")
-            time.sleep(3)
+            time.sleep(2)
+
+            # ── Dismiss the "Power up with Pro" promo popup ───────────────────
+            # The close element is a <div class="crossLayer">, not a button.
+            # EC.element_to_be_clickable can silently fail on divs, so we use
+            # 'visible' and then dispatch a real MouseEvent to trigger React's
+            # synthetic click handler.
+            cross_xpath = "//span[@class='icon' and text()='CrossLayer']"
+            cross = waitForElement(
+                driver, "XPATH", cross_xpath, timeout=8, condition="visible"
+            )
+            if cross:
+                try:
+                    driver.execute_script(
+                        "arguments[0].scrollIntoView({block:'center'});"
+                        "arguments[0].dispatchEvent("
+                        "  new MouseEvent('click', {bubbles:true, cancelable:true, view:window})"
+                        ");",
+                        cross,
+                    )
+                    logger.info("Promo popup dismissed (MouseEvent).")
+                except Exception:
+                    try:
+                        from selenium.webdriver.common.action_chains import ActionChains
+
+                        ActionChains(driver).move_to_element(cross).click().perform()
+                        logger.info("Promo popup dismissed (ActionChains).")
+                    except Exception as e:
+                        logger.warning(f"Could not dismiss promo popup: {e}")
+                time.sleep(1)
+            else:
+                logger.info("No promo popup found — nothing to dismiss.")
+            # ─────────────────────────────────────────────────────────────────
         else:
             logger.error("Save button not found.")
             saveDebugScreenshot(driver, "07_save_not_found")
